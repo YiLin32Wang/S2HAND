@@ -1,11 +1,10 @@
 """
-from https://github.com/akanazawa/cmr by Angjoo Kanazawa !
+from https://github.com/chenyuntc/cmr/blob/master/nnutils/laplacian.py by Yun Chen!
+Change non-static forward/backward methods to static ones
+-------------------------------------------------------------------------------------------------
+Computes Lx and it's derivative, where L is the graph laplacian on the mesh with cotangent weights.
 
-Computes Lx and it's derivative,
-where L is the graph laplacian on the mesh with cotangent weights.
-
-1. Given V, F, computes the cotangent matrix
-(for each face, computes the angles) in pytorch.
+1. Given V, F, computes the cotangent matrix (for each face, computes the angles) in pytorch.
 2. Then it's taken to NP and sparse L is constructed.
 
 Mesh laplacian computation follows Alec Jacobson's gptoolbox.
@@ -21,73 +20,74 @@ import numpy as np
 from scipy import sparse
 
 
-class LaplacianLoss(object):
-    """
-    Encourages minimal mean curvature shapes.
-    """
-
-    def __init__(self, faces, vertices):
-        # Input:
-        #  faces: B x F x 3
-        # V x V
-        self.laplacian = Laplacian(faces, vertices)
-        #self.Lx = None
-
-    def __call__(self, verts):
-        #self.Lx = self.laplacian(verts)
-        Lx0 = self.laplacian(verts)
-        # Reshape to BV x 3
-        #Lx = self.Lx.view(-1, self.Lx.size(2))
-        '''
-        Lx00 = Lx0.cpu().detach().numpy()
-        Lx00 = Lx00.reshape(-1, Lx0.size(2))
-        Lx = torch.from_numpy(Lx00)
-        Lx = Lx.to(device=Lx0.device)
-        '''
-        Lx = Lx0.view(-1, Lx0.size(2))
-        loss = torch.norm(Lx, p=2, dim=1).mean()
-        return loss
-
-    def visualize(self, verts, mv=None):
-        # Visualizes the laplacian.
-        # Verts is B x N x 3 Variable
-        #Lx = self.Lx[0].data.cpu().numpy()
-        Lx = Lx0[0].data.cpu().numpy()
-
-        V = verts[0].data.cpu().numpy()
-
-        from psbody.mesh import Mesh
-
-        F = self.laplacian.F_np[0]
-        mesh = Mesh(V, F)
-
-        weights = np.linalg.norm(Lx, axis=1)
-        mesh.set_vertex_colors_from_weights(weights)
-
-        if mv is not None:
-            mv.set_dynamic_meshes([mesh])
-        else:
-            mesh.show()
-
-
+#############
+### Utils ###
+#############
 def convert_as(src, trg):
-    src = src.type_as(trg)
-    if src.is_cuda:
-        src = src.cuda(device=trg.get_device())
-    return src
+    return src.to(trg.device).type_as(trg)
 
 
-class Laplacian(torch.autograd.Function):
+class LaplacianLoss(torch.nn.Module):
     def __init__(self, faces, vertices):
-        # Faces is B x F x 3, cuda torch Variabe.
-        # Reuse faces.
+        super(LaplacianLoss, self).__init__()
         self.F_np = faces.data.numpy()
-        #import pdb; pdb.set_trace()
-        self.F = faces.long()#torch.Tensor(faces).long()#.cuda().long()#.cuda().long()
+        # import pdb; pdb.set_trace()
+        self.F = faces.long()  # torch.Tensor(faces).long()#.cuda().long()#.cuda().long() #---for this case#
         self.L = None
         self.vertices = vertices
 
     def forward(self, V):
+        V_np = V.detach().cpu().numpy()
+        if self.F.shape[0] != V_np.shape[0]:
+            # Recompute laplacian if batch_size doesn't match
+            self.L = None
+        batchV = V_np.reshape(-1, 3)
+        if self.L is None:
+            #print("Computing the Laplacian!")
+            # Compute cotangents
+            verticess = self.vertices.to(device=V.get_device()) #---for this case#
+            #print(verticess.shape) -- shape: (778,3)
+            sphere_batchV = verticess.unsqueeze(0).repeat(V.shape[0], 1, 1) #---for this case#
+            #print(sphere_batchV.shape) -- shape: (25,778,3)
+            if self.F.dim() == 2:
+                self.F = self.F.unsqueeze(0).repeat(V.shape[0], 1, 1)
+            elif self.F.dim() == 3:
+                if self.F.shape[0] != V.shape[0]:
+                    self.F = self.F[0].unsqueeze(0).repeat(V.shape[0], 1, 1)
+            self.F = self.F.to(device=sphere_batchV.device)
+            C = cotangent(sphere_batchV.detach(), self.F)
+           
+            C_np = C.cpu().numpy()
+            batchC = C_np.reshape(-1, 3)
+            # Adjust face indices to stack:
+            offset = np.arange(0, V.size(0)).reshape(-1, 1, 1) * V.size(1)
+            F_np = self.F_np + offset
+            batchF = F_np.reshape(-1, 3)
+
+            rows = batchF[:, [1, 2, 0]].reshape(-1)
+            cols = batchF[:, [2, 0, 1]].reshape(-1)
+            # Final size is BN x BN
+            BN = batchV.shape[0]
+            L = sparse.csr_matrix((batchC.reshape(-1), (rows, cols)), shape=(BN, BN))
+            L = L + L.T
+            # np.sum on sparse is type 'matrix', so convert to np.array
+            # import ipdb;ipdb.set_trace()
+            M = sparse.diags(np.array(np.sum(L, 1)).reshape(-1), format='csr')
+
+            L = L - M
+            # remember this
+            self.L = L
+        results = Laplacian.apply(V, self.L)
+        return results
+
+
+from torch.autograd.function import once_differentiable
+
+
+class Laplacian(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, V, SL):
         # If forward is explicitly called, V is still a Parameter or Variable
         # But if called through __call__ it's a tensor.
         # This assumes __call__ was used.
@@ -98,62 +98,19 @@ class Laplacian(torch.autograd.Function):
         # Outputs: Lx B x N x 3
         #
         # Numpy also doesnt support sparse tensor, so stack along the batch
-
+        
         V_np = V.cpu().numpy()
-        if self.F.shape[0] != V_np.shape[0]:
-            # Recompute laplacian if batch_size doesn't match
-            self.L = None
         batchV = V_np.reshape(-1, 3)
-
-        if self.L is None:
-            #print("Computing the Laplacian!")
-            # Compute cotangents
-            verticess = self.vertices.to(device=V.get_device())
-            sphere_batchV = verticess.unsqueeze(0).repeat(V.shape[0], 1, 1)
-            #import pdb; pdb.set_trace()
-            #self.F = (self.F).to(device=V.get_device())#？？？？？？？？？？？？？？
-            #import pdb; pdb.set_trace()
-            if self.F.dim() == 2:
-                self.F = self.F.unsqueeze(0).repeat(V.shape[0], 1, 1)
-            elif self.F.dim() == 3:
-                if self.F.shape[0] != V.shape[0]:
-                    self.F = self.F[0].unsqueeze(0).repeat(V.shape[0], 1, 1)
-            #import pdb; pdb.set_trace()
-            #self.F = self.F.to(device=sphere_batchV.device)
-            C = cotangent(sphere_batchV, self.F)
-            
-            C_np = C.cpu().numpy()
-            batchC = C_np.reshape(-1, 3)
-            # Adjust face indices to stack:
-            offset = np.arange(0, V.size(0)).reshape(-1, 1, 1) * V.size(1)
-            
-            F_np = self.F_np + offset
-            batchF = F_np.reshape(-1, 3)
-
-            rows = batchF[:, [1, 2, 0]].reshape(-1)
-            cols = batchF[:, [2, 0, 1]].reshape(-1)
-            # Final size is BN x BN
-            BN = batchV.shape[0]
-            L = sparse.csr_matrix(
-                (batchC.reshape(-1), (rows, cols)), shape=(BN, BN)
-            )
-            L = L + L.T
-            # np.sum on sparse is type 'matrix', so convert to np.array
-            M = sparse.diags(np.array(np.sum(L, 1)).reshape(-1), format="csr")
-            L = L - M
-            # remember this
-            self.L = L
-            # import matplotlib.pylab as plt
-            # plt.spy(L)  # Displays sparsity pattern
-            # plt.show()
-
-        Lx = self.L.dot(batchV).reshape(V_np.shape)
-
+        Lx = SL.dot(batchV).reshape(V_np.shape)
+        ctx.L = SL
         out = convert_as(torch.Tensor(Lx), V)
         out = out.to(device=V.device)
+
         return out#convert_as(torch.Tensor(Lx), V)
 
-    def backward(self, grad_out):
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_out):
         """
         Just L'g = Lg
         Args:
@@ -164,9 +121,11 @@ class Laplacian(torch.autograd.Function):
         g_o = grad_out.cpu().numpy()
         # Stack
         g_o = g_o.reshape(-1, 3)
-        Lg = self.L.dot(g_o).reshape(grad_out.shape)
-
-        return convert_as(torch.Tensor(Lg), grad_out)
+        Lg = ctx.L.dot(g_o).reshape(grad_out.shape)
+        # print('----------------------finish')
+        cc = convert_as(torch.Tensor(Lg), grad_out)
+        # print(cc.device,'-----')
+        return cc, None
 
 
 def cotangent(V, F):
@@ -178,8 +137,6 @@ def cotangent(V, F):
     #     angles for triangles, columns correspond to edges 23,31,12
 
     # B x F x 3 x 3
-    #V = V.cuda(device=F.get_device())
-    F = F.cuda(device=V.device)
     indices_repeat = torch.stack([F, F, F], dim=2)
 
     v1 = torch.gather(V, 1, indices_repeat[:, :, :, 0])
